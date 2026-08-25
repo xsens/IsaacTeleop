@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Xsens Technologies B.V. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: xsens_full_body
+description: "Xsens MVN full-body stream over UDP, republished as an OpenXR tensor collection"
+command: "./xsens_full_body_plugin"
+version: "0.1.0"
+args:
+  - "xsens_full_body"
+  - "9764"
+  - "4096"
+devices:
+  - path: "/mocap/xsens"
+    type: "xsens_full_body"
+    description: "Xsens MVN 24-joint full-body pose (hands untracked)"
