@@ -122,7 +122,12 @@ socket and an OpenXR session and cannot be constructed without a running CloudXR
 logic was previously reachable only through a live end-to-end run.
 
 ```bash
-ctest -R xsens_frame_decision            # or run ./test_xsens_frame_decision directly
+# from the IsaacTeleop checkout, once configured with -DBUILD_TESTING=ON (see apply.sh)
+ctest --test-dir build-py312 -R xsens_frame_decision
+
+# or, with no build tree at all -- the unit pulls in nothing but flatbuffers and the schema
+g++ -std=c++20 -I. -I<generated-schema-dir> -I<flatbuffers-include> \
+    tests/test_frame_decision.cpp frame_decision.cpp -lflatbuffers -o /tmp/t && /tmp/t
 ```
 
 114 assertions, no runtime, no socket, no suit, milliseconds to run. The suite is
