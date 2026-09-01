@@ -3,6 +3,7 @@
 
 #include "xsens_full_body_plugin.hpp"
 
+#include <atomic>
 #include <charconv>
 #include <csignal>
 #include <cstdint>
@@ -23,11 +24,13 @@ constexpr uint16_t DEFAULT_UDP_PORT = 9764;
 constexpr size_t DEFAULT_MAX_FLATBUFFER_SIZE = 4096;
 constexpr uint64_t STATS_EVERY = 250;
 
-volatile std::sig_atomic_t g_stop = 0;
+//! Atomic rather than volatile sig_atomic_t: the plugin observes this from inside its recovery
+//! backoffs, so a stop request lands during an outage instead of waiting the budget out.
+std::atomic<bool> g_stop{ false };
 
-void handle_signal(int)
+extern "C" void handle_signal(int)
 {
-    g_stop = 1;
+    g_stop.store(true, std::memory_order_relaxed);
 }
 
 bool parse_size(std::string_view text, size_t& out)
@@ -45,6 +48,20 @@ void usage(const char* argv0)
               << "Isaac Teleop tensor collection, readable via the `body.xsens` vendor.\n\n"
               << "Defaults: " << DEFAULT_COLLECTION_ID << " " << DEFAULT_UDP_PORT << " " << DEFAULT_MAX_FLATBUFFER_SIZE
               << "  (matching MVN's \"Isaac Teleop\" preset)\n";
+}
+
+//! Every counter, on one line. Printed periodically and once more on exit -- including the
+//! unrecoverable-outage exit, so a pusher that gave up still says what it saw first.
+void print_stats(const XsensFullBodyStats& s, const char* prefix)
+{
+    std::cout << prefix << "delivered=" << s.delivered << " seq=" << s.last_seq << " size=" << s.last_size
+              << " fnv1a64=0x" << std::hex << s.last_hash << std::dec << " malformed=" << s.dropped_malformed
+              << " unverified=" << s.dropped_unverified << " stale=" << s.dropped_stale
+              << " truncated=" << s.dropped_truncated << " gapEvents=" << s.sequence_gap_events
+              << " seqSkipped=" << s.sequence_numbers_skipped << " resets=" << s.session_resets
+              << " rewinds=" << s.timeline_rewinds << " nonWholeMs=" << s.non_whole_ms_samples
+              << " socketRecoveries=" << s.socket_recoveries << " socketRecoveryFailures=" << s.socket_recovery_failures
+              << " pushFailures=" << s.push_failures << " sessionRecoveries=" << s.session_recoveries << std::endl;
 }
 
 } // namespace
@@ -96,30 +113,34 @@ try
     std::cout << "In MVN Studio: Options -> Network Streamer -> preset \"Isaac Teleop\", tick the row, press Play."
               << std::endl;
 
+    // A broken socket or a restarted CloudXR runtime is recovered inside update(). It only throws
+    // once a retry budget is exhausted, which is the operator-restart case -- and even then the
+    // counters go out, because they are usually the only record of what led up to it.
+    int exit_code = 0;
     uint64_t since_stats = 0;
-    while (g_stop == 0)
+    try
     {
-        if (!plugin.update())
+        while (!g_stop.load(std::memory_order_relaxed))
         {
-            continue;
-        }
-        if (++since_stats >= STATS_EVERY)
-        {
-            since_stats = 0;
-            const auto& s = plugin.stats();
-            std::cout << "[XsensFullBody] delivered=" << s.delivered << " seq=" << s.last_seq << " size=" << s.last_size
-                      << " fnv1a64=0x" << std::hex << s.last_hash << std::dec << " malformed=" << s.dropped_malformed
-                      << " unverified=" << s.dropped_unverified << " stale=" << s.dropped_stale
-                      << " gaps=" << s.sequence_gaps << " resets=" << s.session_resets
-                      << " rewinds=" << s.timeline_rewinds << std::endl;
+            if (!plugin.update(g_stop))
+            {
+                continue;
+            }
+            if (++since_stats >= STATS_EVERY)
+            {
+                since_stats = 0;
+                print_stats(plugin.stats(), "[XsensFullBody] ");
+            }
         }
     }
+    catch (const std::exception& e)
+    {
+        std::cerr << "\n" << argv[0] << ": " << e.what() << std::endl;
+        exit_code = 1;
+    }
 
-    const auto& s = plugin.stats();
-    std::cout << "\nstopped: delivered=" << s.delivered << " malformed=" << s.dropped_malformed
-              << " unverified=" << s.dropped_unverified << " stale=" << s.dropped_stale << " gaps=" << s.sequence_gaps
-              << " resets=" << s.session_resets << " rewinds=" << s.timeline_rewinds << std::endl;
-    return 0;
+    print_stats(plugin.stats(), "\nstopped: ");
+    return exit_code;
 }
 catch (const std::exception& e)
 {

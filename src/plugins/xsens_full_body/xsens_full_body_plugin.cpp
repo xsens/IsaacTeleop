@@ -3,21 +3,26 @@
 
 #include "xsens_full_body_plugin.hpp"
 
+#include "frame_decision.hpp"
 #include "teleop_wire.hpp"
 
 #include <arpa/inet.h>
-#include <flatbuffers/flatbuffers.h>
 #include <netinet/in.h>
 #include <oxr/oxr_session.hpp>
 #include <oxr_utils/os_time.hpp>
-#include <schema/full_body_generated.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 
 #include <cerrno>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
 #include <unistd.h>
 
 namespace plugins
@@ -31,47 +36,83 @@ namespace
 constexpr std::string_view TENSOR_IDENTIFIER = "full_body_pose";
 //! Bounded so a stalled MVN cannot wedge the loop; the caller just gets a false from update().
 constexpr int RECV_TIMEOUT_MS = 250;
-//! MVN's datagram is 820 B. Anything wildly larger is not ours; cap the read buffer generously.
+//! MVN's datagram is 820 B. Larger than the 65507 B maximum IPv4 UDP payload, so a valid
+//! datagram is never truncated and the MSG_TRUNC check below is belt and braces.
 constexpr size_t RECV_BUFFER_SIZE = 64 * 1024;
-constexpr int64_t NS_PER_MS = 1000000;
 
-/*!
- * @brief Full FlatBuffers bounds check on a payload before it is trusted.
- *
- * Mandatory, and easy to skip by accident: `deserialize_teleop_frame` validates *framing* only
- * and never looks inside the payload. It also cannot use a generated `VerifyFullBodyPoseBuffer`,
- * because the schema's `root_type` is `FullBodyPoseRecord` and flatc emits no verifier for a
- * non-root table -- hence `VerifyBuffer<FullBodyPose>` by hand.
- */
-bool verify_full_body_payload(const uint8_t* data, size_t size)
-{
-    if (data == nullptr || size == 0)
-    {
-        return false;
-    }
-    flatbuffers::Verifier verifier(data, size);
-    return verifier.VerifyBuffer<core::FullBodyPose>(nullptr);
-}
+//! Log every event of a category on its 1st and every 100th occurrence.
+constexpr uint64_t LOG_EVERY = 100;
+
+//! Socket re-bind budget: ~2.3 s total. A hard recv error is almost always transient (an
+//! interface bounce); anything longer than this is a machine problem, not a blip.
+constexpr int SOCKET_BACKOFF_MS[] = { 100, 200, 400, 800, 800 };
+constexpr int SOCKET_RECOVERY_ATTEMPTS = static_cast<int>(std::size(SOCKET_BACKOFF_MS));
+
+//! Session re-establish budget: ~23.5 s total. Sized for a CloudXR runtime restart, which is
+//! slow -- the runtime has to come up and re-advertise its extensions before we can bind again.
+constexpr int SESSION_BACKOFF_MS[] = { 500, 1000, 2000, 4000, 4000, 4000, 4000, 4000 };
+constexpr int SESSION_RECOVERY_ATTEMPTS = static_cast<int>(std::size(SESSION_BACKOFF_MS));
+
+//! Backoffs are slept in slices so a stop request during a long outage lands promptly.
+constexpr int BACKOFF_SLICE_MS = 50;
 
 } // namespace
 
 XsensFullBodyPlugin::XsensFullBodyPlugin(const std::string& collection_id, uint16_t udp_port, size_t max_flatbuffer_size)
-    : buffer_(RECV_BUFFER_SIZE),
-      session_(
-          std::make_shared<core::OpenXRSession>("XsensFullBodyPlugin", core::SchemaPusher::get_required_extensions())),
-      pusher_(session_->get_handles(),
-              core::SchemaPusherConfig{ .collection_id = collection_id,
-                                        .max_flatbuffer_size = max_flatbuffer_size,
-                                        .tensor_identifier = std::string(TENSOR_IDENTIFIER),
-                                        .localized_name = "Xsens Full Body",
-                                        .app_name = "XsensFullBodyPlugin" })
+    : collection_id_(collection_id),
+      max_flatbuffer_size_(max_flatbuffer_size),
+      buffer_(RECV_BUFFER_SIZE),
+      decider_(max_flatbuffer_size)
 {
+    read_recv_error_injection();
+
+    // Session before socket: if the CloudXR runtime is absent we fail before taking the port,
+    // so a retried start does not collide with itself.
+    establish_session();
     open_socket(udp_port);
+}
+
+void XsensFullBodyPlugin::read_recv_error_injection()
+{
+    const char* spec = std::getenv("XSENS_TELEOP_INJECT_RECV_ERRORS");
+    if (spec == nullptr)
+    {
+        return;
+    }
+    // "<count>" or "<count>:<errno>"; ENOTCONN by default because it is unambiguously hard.
+    char* rest = nullptr;
+    const long count = std::strtol(spec, &rest, 10);
+    inject_recv_errors_left_ = (count > 0) ? static_cast<int>(count) : 0;
+    inject_recv_errno_ =
+        (rest != nullptr && *rest == ':') ? static_cast<int>(std::strtol(rest + 1, nullptr, 10)) : ENOTCONN;
+    if (inject_recv_errors_left_ > 0)
+    {
+        std::cerr << "[XsensFullBody] TEST HOOK: forcing the next " << inject_recv_errors_left_
+                  << " recv call(s) to fail with errno " << inject_recv_errno_ << " ("
+                  << std::strerror(inject_recv_errno_) << ")" << std::endl;
+    }
 }
 
 XsensFullBodyPlugin::~XsensFullBodyPlugin()
 {
     close_socket();
+}
+
+void XsensFullBodyPlugin::establish_session()
+{
+    // Torn down first, and in this order: once the runtime's IPC pipe breaks, the pusher's
+    // collection handle is dead and only a full re-create works.
+    pusher_.reset();
+    session_.reset();
+
+    session_ =
+        std::make_shared<core::OpenXRSession>("XsensFullBodyPlugin", core::SchemaPusher::get_required_extensions());
+    pusher_.emplace(
+        session_->get_handles(), core::SchemaPusherConfig{ .collection_id = collection_id_,
+                                                           .max_flatbuffer_size = max_flatbuffer_size_,
+                                                           .tensor_identifier = std::string(TENSOR_IDENTIFIER),
+                                                           .localized_name = "Xsens Full Body",
+                                                           .app_name = "XsensFullBodyPlugin" });
 }
 
 void XsensFullBodyPlugin::open_socket(uint16_t port)
@@ -121,92 +162,246 @@ void XsensFullBodyPlugin::close_socket()
     }
 }
 
-bool XsensFullBodyPlugin::update()
+void XsensFullBodyPlugin::log_rate_limited(LogCategory category, const std::string& message, std::ostream& out)
 {
-    const ssize_t received = ::recv(socket_fd_, buffer_.data(), buffer_.size(), 0);
-    if (received <= 0)
+    const uint64_t n = ++log_counts_[category];
+    if (n == 1 || (n % LOG_EVERY) == 0)
     {
-        return false; // timeout, or MVN is not streaming yet
-    }
-
-    const auto frame = deserialize_teleop_frame(buffer_.data(), static_cast<size_t>(received));
-    if (!frame)
-    {
-        ++stats_.dropped_malformed;
-        return false;
-    }
-
-    // A payload larger than the collection was created for would be rejected by push_buffer
-    // anyway; catching it here names the real number instead of an OpenXR error code.
-    if (frame->payload_size > pusher_.config().max_flatbuffer_size)
-    {
-        ++stats_.dropped_malformed;
-        std::cerr << "[XsensFullBody] payload " << frame->payload_size << " B exceeds max_flatbuffer_size "
-                  << pusher_.config().max_flatbuffer_size << " -- raise it on BOTH pusher and reader" << std::endl;
-        return false;
-    }
-
-    if (!verify_full_body_payload(frame->payload, frame->payload_size))
-    {
-        ++stats_.dropped_unverified;
-        return false;
-    }
-
-    // seq is per-emitter, monotonic and sent-only. It resets to 0 when MVN starts a new session,
-    // so a step backwards is a session boundary rather than an error. Note a gap is NOT reliable
-    // evidence of transport loss: MVN also skips seq for frames it declines to build.
-    if (have_seq_)
-    {
-        if (frame->seq == 0 && expected_seq_ != 0)
+        out << "[XsensFullBody] " << message;
+        if (n > 1)
         {
-            ++stats_.session_resets;
-            last_sample_time_ns_ = 0;
-            std::cout << "[XsensFullBody] sequence reset -> new MVN session" << std::endl;
+            out << " (x" << n << ")";
         }
-        else if (frame->seq < expected_seq_)
-        {
-            ++stats_.dropped_stale;
-            return false; // duplicate or reordered datagram
-        }
-        else if (frame->seq > expected_seq_)
-        {
-            ++stats_.sequence_gaps;
-        }
+        out << std::endl;
     }
-    have_seq_ = true;
-    expected_seq_ = frame->seq + 1;
+}
 
-    // MVN solves at millisecond resolution, so a sub-millisecond sample time means the frame did
-    // not come from MVN's solver and should not be trusted as a clock reference.
-    if (frame->sample_time_ns % NS_PER_MS != 0)
+bool XsensFullBodyPlugin::wait_unless_stopped(int total_ms, const std::atomic<bool>& stop)
+{
+    for (int remaining = total_ms; remaining > 0; remaining -= BACKOFF_SLICE_MS)
     {
-        ++stats_.dropped_malformed;
+        if (stop.load(std::memory_order_relaxed))
+        {
+            return false;
+        }
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(remaining < BACKOFF_SLICE_MS ? remaining : BACKOFF_SLICE_MS));
+    }
+    return !stop.load(std::memory_order_relaxed);
+}
+
+bool XsensFullBodyPlugin::recover_socket(const std::atomic<bool>& stop)
+{
+    // Without a port, re-binding would take an ephemeral one the sender cannot reach -- which
+    // looks like a working pusher that never receives anything. Refuse instead.
+    if (port_ == 0)
+    {
+        ++stats_.socket_recovery_failures;
         return false;
     }
 
-    // A sample time that moves BACKWARDS is a timeline discontinuity, not a stale frame, and it
-    // must not be dropped: scrubbing or restarting a recording rewinds MVN's clock while `seq`
-    // keeps climbing, so rejecting these silently throws away every frame of a looped playback
-    // (measured: 1315 frames lost in one run before this was fixed). Duplicates and reordering
-    // are already handled by the `seq` check above, which is the authority on frame identity.
-    if (frame->sample_time_ns < last_sample_time_ns_)
+    for (int attempt = 0; attempt < SOCKET_RECOVERY_ATTEMPTS; ++attempt)
+    {
+        if (!wait_unless_stopped(SOCKET_BACKOFF_MS[attempt], stop))
+        {
+            return false;
+        }
+
+        close_socket(); // the dead fd, before asking for a new one
+        try
+        {
+            open_socket(port_);
+            ++stats_.socket_recoveries;
+            log_rate_limited(LC_SOCKET_RECOVERED,
+                             "socket re-bound to UDP port " + std::to_string(port_) + ", receive loop continuing",
+                             std::cerr);
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            // Expected while the interface is down; the caller reports the give-up.
+            if (attempt == SOCKET_RECOVERY_ATTEMPTS - 1)
+            {
+                std::cerr << "[XsensFullBody] final socket re-bind attempt failed: " << e.what() << std::endl;
+            }
+        }
+    }
+
+    ++stats_.socket_recovery_failures;
+    return false;
+}
+
+bool XsensFullBodyPlugin::recover_session(const std::atomic<bool>& stop)
+{
+    for (int attempt = 0; attempt < SESSION_RECOVERY_ATTEMPTS; ++attempt)
+    {
+        if (!wait_unless_stopped(SESSION_BACKOFF_MS[attempt], stop))
+        {
+            return false;
+        }
+
+        try
+        {
+            establish_session();
+            ++stats_.session_recoveries;
+            std::cout << "[XsensFullBody] OpenXR session re-established after " << (attempt + 1)
+                      << " attempt(s); resuming push" << std::endl;
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            // Expected while the runtime is down. Log only the first and last attempt, so a long
+            // outage cannot flood the console with one line per retry.
+            if (attempt == 0 || attempt == SESSION_RECOVERY_ATTEMPTS - 1)
+            {
+                std::cerr << "[XsensFullBody] session re-establish attempt " << (attempt + 1) << "/"
+                          << SESSION_RECOVERY_ATTEMPTS << " failed: " << e.what() << std::endl;
+            }
+        }
+    }
+    return false;
+}
+
+bool XsensFullBodyPlugin::update(const std::atomic<bool>& stop)
+{
+    ssize_t received;
+    if (inject_recv_errors_left_ > 0) // test hook; see read_recv_error_injection()
+    {
+        --inject_recv_errors_left_;
+        errno = inject_recv_errno_;
+        received = -1;
+    }
+    else
+    {
+        // MSG_TRUNC makes recv report the datagram's real length even when it overflowed the
+        // buffer, so an over-large datagram is dropped rather than processed from a partial one.
+        received = ::recv(socket_fd_, buffer_.data(), buffer_.size(), MSG_TRUNC);
+    }
+    if (received < 0)
+    {
+        // The idle path: the receive timeout expired, or a signal landed. Not an error, and it is
+        // what paces this loop while MVN is not streaming.
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+        {
+            return false;
+        }
+
+        // Anything else is a hard socket error. Without this branch it would be indistinguishable
+        // from "MVN is not streaming yet" and would spin the caller's loop at full CPU.
+        const std::string reason = std::strerror(errno);
+        log_rate_limited(
+            LC_SOCKET_ERROR, "recv failed: " + reason + " -- re-binding UDP port " + std::to_string(port_), std::cerr);
+        if (!recover_socket(stop))
+        {
+            if (stop.load(std::memory_order_relaxed))
+            {
+                return false; // stopping anyway; let the caller's loop exit normally
+            }
+            throw std::runtime_error("XsensFullBodyPlugin: UDP socket unrecoverable after " +
+                                     std::to_string(SOCKET_RECOVERY_ATTEMPTS) +
+                                     " re-bind attempts (last error: " + reason + ")");
+        }
+        return false;
+    }
+    if (received == 0)
+    {
+        return false; // empty datagram
+    }
+    if (static_cast<size_t>(received) > buffer_.size())
+    {
+        ++stats_.dropped_truncated;
+        log_rate_limited(LC_TRUNCATED, "dropped over-large datagram (" + std::to_string(received) + " B)", std::cerr);
+        return false;
+    }
+
+    const FrameOutcome outcome = decider_.classify(buffer_.data(), static_cast<size_t>(received));
+
+    // Events are independent of the verdict: a delivered frame can still carry a session reset
+    // or a rewind, so these are counted before the verdict is acted on.
+    if (outcome.session_reset)
+    {
+        ++stats_.session_resets;
+        log_rate_limited(LC_SESSION_RESET, "sequence reset -> new MVN session", std::cout);
+    }
+    if (outcome.sequence_numbers_skipped > 0)
+    {
+        ++stats_.sequence_gap_events;
+        stats_.sequence_numbers_skipped += outcome.sequence_numbers_skipped;
+    }
+    if (outcome.non_whole_ms)
+    {
+        ++stats_.non_whole_ms_samples;
+        log_rate_limited(LC_NON_WHOLE_MS,
+                         "sample time is not a whole millisecond -- not from MVN's solver; delivering anyway", std::cout);
+    }
+    if (outcome.timeline_rewind)
     {
         ++stats_.timeline_rewinds;
-        std::cout << "[XsensFullBody] sample time moved backwards -- timeline rewind (scrub or "
-                     "recording restart)"
-                  << std::endl;
+        log_rate_limited(LC_TIMELINE_REWIND,
+                         "sample time moved backwards -- timeline rewind (scrub or recording restart)", std::cout);
     }
-    last_sample_time_ns_ = frame->sample_time_ns;
+
+    switch (outcome.verdict)
+    {
+    case FrameVerdict::Deliver:
+        break;
+    case FrameVerdict::DroppedOversize:
+        // Counted as malformed, like any other unusable frame; logged separately because the
+        // fix is specific and the number is the whole diagnosis.
+        ++stats_.dropped_malformed;
+        log_rate_limited(LC_OVERSIZE_PAYLOAD,
+                         "payload " + std::to_string(outcome.observed_payload_size) + " B exceeds max_flatbuffer_size " +
+                             std::to_string(max_flatbuffer_size_) + " -- raise it on BOTH pusher and reader",
+                         std::cerr);
+        return false;
+    case FrameVerdict::DroppedMalformed:
+        ++stats_.dropped_malformed;
+        return false;
+    case FrameVerdict::DroppedUnverified:
+        ++stats_.dropped_unverified;
+        return false;
+    case FrameVerdict::DroppedStale:
+        ++stats_.dropped_stale;
+        return false;
+    }
 
     // The header's sample_time_ns is on MVN's SEND-HOST clock -- a different domain from ours,
     // so it must not be published as the local common clock. Stamp the common clock here, at
     // publish time, and forward MVN's device clock verbatim alongside it.
-    pusher_.push_buffer(frame->payload, frame->payload_size, core::os_monotonic_now_ns(), frame->raw_device_time_ns);
+    //
+    // push_buffer THROWS on failure, and a dead CloudXR runtime arrives as
+    // XR_ERROR_RUNTIME_FAILURE rather than anything session-shaped. Uncaught, a runtime restart
+    // would take the whole pusher down with it.
+    try
+    {
+        pusher_->push_buffer(
+            outcome.payload, outcome.payload_size, core::os_monotonic_now_ns(), outcome.raw_device_time_ns);
+    }
+    catch (const std::exception& e)
+    {
+        ++stats_.push_failures;
+        log_rate_limited(LC_PUSH_FAILED,
+                         "push failed at seq=" + std::to_string(outcome.seq) + ": " + e.what() +
+                             " -- re-establishing the OpenXR session",
+                         std::cerr);
+        if (!recover_session(stop))
+        {
+            if (stop.load(std::memory_order_relaxed))
+            {
+                return false; // stopping anyway; let the caller's loop exit normally
+            }
+            throw std::runtime_error("XsensFullBodyPlugin: OpenXR session unrecoverable after " +
+                                     std::to_string(SESSION_RECOVERY_ATTEMPTS) +
+                                     " re-establish attempts -- restart the CloudXR runtime, then restart "
+                                     "this pusher");
+        }
+        return false; // recovered, but this frame is now stale; the next one goes out
+    }
 
     ++stats_.delivered;
-    stats_.last_seq = frame->seq;
-    stats_.last_size = frame->payload_size;
-    stats_.last_hash = fnv1a64(frame->payload, frame->payload_size);
+    stats_.last_seq = outcome.seq;
+    stats_.last_size = outcome.payload_size;
+    stats_.last_hash = fnv1a64(outcome.payload, outcome.payload_size);
     return true;
 }
 
