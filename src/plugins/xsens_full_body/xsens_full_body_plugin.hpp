@@ -4,6 +4,7 @@
 #pragma once
 
 #include "frame_decision.hpp"
+#include "plugin_options.hpp"
 
 #include <pusherio/schema_pusher.hpp>
 
@@ -85,7 +86,7 @@ struct XsensFullBodyStats
 class XsensFullBodyPlugin
 {
 public:
-    XsensFullBodyPlugin(const std::string& collection_id, uint16_t udp_port, size_t max_flatbuffer_size);
+    explicit XsensFullBodyPlugin(const XsensFullBodyOptions& options);
     ~XsensFullBodyPlugin();
 
     XsensFullBodyPlugin(const XsensFullBodyPlugin&) = delete;
@@ -133,14 +134,14 @@ private:
     //! Read the XSENS_TELEOP_INJECT_RECV_ERRORS test hook. No-op unless it is set.
     void read_recv_error_injection();
 
-    void open_socket(uint16_t port);
+    void open_socket(const std::string& address, uint16_t port);
     void close_socket();
 
     //! Create the OpenXR session and the pusher on it. Also the recovery path: both are torn
     //! down first, because once the runtime's IPC pipe breaks only a full re-create works.
     void establish_session();
 
-    //! Re-bind the same port after a hard `recv` error, on a bounded backoff. Stream state is
+    //! Re-bind the same address and port after a hard `recv` error, on a bounded backoff. Stream state is
     //! deliberately left alone: the outage reappears as a sequence gap or a session reset, and
     //! both are already handled. \return false if \a stop was set or the budget ran out.
     bool recover_socket(const std::atomic<bool>& stop);
@@ -162,6 +163,10 @@ private:
     size_t max_flatbuffer_size_ = 0;
 
     int socket_fd_ = -1;
+    //! The address and port actually bound, assigned only once `bind()` has succeeded -- so a
+    //! zero `port_` still means "never successfully bound", and recovery cannot drift onto a
+    //! different interface than the one the operator asked for.
+    std::string bind_address_;
     uint16_t port_ = 0;
     //! Recovery-matrix test hook, set from XSENS_TELEOP_INJECT_RECV_ERRORS=<n>[:<errno>]. Forces
     //! the next n recv calls to fail hard, which is the only practical way to exercise

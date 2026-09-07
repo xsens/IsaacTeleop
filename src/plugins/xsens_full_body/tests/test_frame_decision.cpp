@@ -268,11 +268,6 @@ void test_session_reset()
 
 void test_duplicate_seq_zero_is_stale_not_a_reset()
 {
-    // Regression test for bill-of-work item 5. The reset predicate used to be written against
-    // `expected_seq_ != 0`, meaning "we have seen a non-zero seq" -- but expected_seq_ is
-    // last + 1, so it was already 1 after a single frame at seq 0. A *duplicate* of seq 0 then
-    // satisfied it: counted as a session reset, timeline cleared, and pushed to the robot,
-    // where it should have been dropped as stale.
     FrameDecider d(MAX_FB);
     CHECK(classify(d, good_frame(0, 100)).verdict == FrameVerdict::Deliver);
 

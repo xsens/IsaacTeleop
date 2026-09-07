@@ -1,27 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 Xsens Technologies B.V. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#include "plugin_options.hpp"
 #include "xsens_full_body_plugin.hpp"
 
 #include <atomic>
-#include <charconv>
 #include <csignal>
 #include <cstdint>
-#include <cstdlib>
 #include <iostream>
 #include <string>
-#include <string_view>
 
 using namespace plugins::xsens_full_body;
 
 namespace
 {
 
-constexpr std::string_view DEFAULT_COLLECTION_ID = "xsens_full_body";
-constexpr uint16_t DEFAULT_UDP_PORT = 9764;
-//! Must match the reader's `max_flatbuffer_size`. A mismatch throws loudly on both sides -- which
-//! is the good case; a `collection_id` mismatch instead fails silently and forever.
-constexpr size_t DEFAULT_MAX_FLATBUFFER_SIZE = 4096;
 constexpr uint64_t STATS_EVERY = 250;
 
 //! Atomic rather than volatile sig_atomic_t: the plugin observes this from inside its recovery
@@ -33,21 +26,24 @@ extern "C" void handle_signal(int)
     g_stop.store(true, std::memory_order_relaxed);
 }
 
-bool parse_size(std::string_view text, size_t& out)
-{
-    const char* begin = text.data();
-    const char* end = begin + text.size();
-    const auto [ptr, error] = std::from_chars(begin, end, out);
-    return error == std::errc{} && ptr == end && out > 0;
-}
-
 void usage(const char* argv0)
 {
-    std::cerr << "Usage: " << argv0 << " [collection_id] [udp_port] [max_flatbuffer_size]\n\n"
+    const XsensFullBodyOptions defaults;
+    std::cerr << "Usage: " << argv0 << " [options]\n\n"
               << "Receives Xsens MVN Studio's Isaac Teleop UDP stream and republishes it as an\n"
               << "Isaac Teleop tensor collection, readable via the `body.xsens` vendor.\n\n"
-              << "Defaults: " << DEFAULT_COLLECTION_ID << " " << DEFAULT_UDP_PORT << " " << DEFAULT_MAX_FLATBUFFER_SIZE
-              << "  (matching MVN's \"Isaac Teleop\" preset)\n";
+              << "Options:\n"
+              << "  --collection-id=ID        Tensor collection id (default: " << defaults.collection_id << ")\n"
+              << "  --address=ADDR            Interface to bind, literal IPv4 (default: " << defaults.bind_address
+              << ")\n"
+              << "  --port=N                  UDP port to listen on (default: " << defaults.udp_port << ")\n"
+              << "  --max-flatbuffer-size=N   Max serialized frame size, must match the reader\n"
+              << "                            (default: " << defaults.max_flatbuffer_size << ")\n"
+              << "  --help                    Show this message\n\n"
+              << "The defaults match MVN's \"Isaac Teleop\" preset. `--address=127.0.0.1` confines the\n"
+              << "pusher to loopback; the default accepts the stream on every interface.\n\n"
+              << "Deprecated: the positional form `[collection_id] [udp_port] [max_flatbuffer_size]`\n"
+              << "is still accepted, but cannot be mixed with the flags above.\n";
 }
 
 //! Every counter, on one line. Printed periodically and once more on exit -- including the
@@ -69,47 +65,37 @@ void print_stats(const XsensFullBodyStats& s, const char* prefix)
 int main(int argc, char** argv)
 try
 {
-    if (argc > 1 && (std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h"))
+    XsensFullBodyOptions options;
+    std::string parse_error;
+    switch (parse_options(argc, argv, options, parse_error))
     {
+    case ParseOutcome::HelpRequested:
         usage(argv[0]);
         return 0;
-    }
-    if (argc > 4)
-    {
+    case ParseOutcome::Error:
+        std::cerr << argv[0] << ": " << parse_error << "\n\n";
         usage(argv[0]);
         return 1;
+    case ParseOutcome::Ok:
+        break;
     }
 
-    const std::string collection_id = (argc > 1) ? argv[1] : std::string(DEFAULT_COLLECTION_ID);
-
-    uint16_t udp_port = DEFAULT_UDP_PORT;
-    if (argc > 2)
+    if (options.used_legacy_positionals)
     {
-        size_t parsed = 0;
-        if (!parse_size(argv[2], parsed) || parsed > 65535)
-        {
-            std::cerr << argv[0] << ": invalid udp_port '" << argv[2] << "'" << std::endl;
-            return 1;
-        }
-        udp_port = static_cast<uint16_t>(parsed);
-    }
-
-    size_t max_flatbuffer_size = DEFAULT_MAX_FLATBUFFER_SIZE;
-    if (argc > 3 && !parse_size(argv[3], max_flatbuffer_size))
-    {
-        std::cerr << argv[0] << ": invalid max_flatbuffer_size '" << argv[3] << "'" << std::endl;
-        return 1;
+        std::cerr << argv[0] << ": warning: the positional argument form is deprecated; use"
+                  << " --collection-id=, --port= and --max-flatbuffer-size= instead" << std::endl;
     }
 
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
 
-    std::cout << "Xsens Full Body Pusher (collection: " << collection_id << ", tensor: full_body_pose"
-              << ", udp: 0.0.0.0:" << udp_port << ", max_flatbuffer_size: " << max_flatbuffer_size << ")" << std::endl;
+    std::cout << "Xsens Full Body Pusher (collection: " << options.collection_id << ", tensor: full_body_pose"
+              << ", udp: " << options.bind_address << ":" << options.udp_port
+              << ", max_flatbuffer_size: " << options.max_flatbuffer_size << ")" << std::endl;
 
-    XsensFullBodyPlugin plugin(collection_id, udp_port, max_flatbuffer_size);
+    XsensFullBodyPlugin plugin(options);
 
-    std::cout << "listening on 0.0.0.0:" << udp_port << " -> push_buffer" << std::endl;
+    std::cout << "listening on " << options.bind_address << ":" << options.udp_port << " -> push_buffer" << std::endl;
     std::cout << "In MVN Studio: Options -> Network Streamer -> preset \"Isaac Teleop\", tick the row, press Play."
               << std::endl;
 

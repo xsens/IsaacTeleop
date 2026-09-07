@@ -58,18 +58,18 @@ constexpr int BACKOFF_SLICE_MS = 50;
 
 } // namespace
 
-XsensFullBodyPlugin::XsensFullBodyPlugin(const std::string& collection_id, uint16_t udp_port, size_t max_flatbuffer_size)
-    : collection_id_(collection_id),
-      max_flatbuffer_size_(max_flatbuffer_size),
+XsensFullBodyPlugin::XsensFullBodyPlugin(const XsensFullBodyOptions& options)
+    : collection_id_(options.collection_id),
+      max_flatbuffer_size_(options.max_flatbuffer_size),
       buffer_(RECV_BUFFER_SIZE),
-      decider_(max_flatbuffer_size)
+      decider_(options.max_flatbuffer_size)
 {
     read_recv_error_injection();
 
     // Session before socket: if the CloudXR runtime is absent we fail before taking the port,
     // so a retried start does not collide with itself.
     establish_session();
-    open_socket(udp_port);
+    open_socket(options.bind_address, options.udp_port);
 }
 
 void XsensFullBodyPlugin::read_recv_error_injection()
@@ -115,8 +115,16 @@ void XsensFullBodyPlugin::establish_session()
                                                            .app_name = "XsensFullBodyPlugin" });
 }
 
-void XsensFullBodyPlugin::open_socket(uint16_t port)
+void XsensFullBodyPlugin::open_socket(const std::string& address, uint16_t port)
 {
+    in_addr bind_addr{};
+    if (::inet_pton(AF_INET, address.c_str(), &bind_addr) != 1)
+    {
+        // Validated at parse time (see plugin_options.cpp), so reaching here is a programmer
+        // error rather than operator input.
+        throw std::runtime_error("XsensFullBodyPlugin: '" + address + "' is not a literal IPv4 address");
+    }
+
     socket_fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (socket_fd_ < 0)
     {
@@ -139,17 +147,30 @@ void XsensFullBodyPlugin::open_socket(uint16_t port)
         throw std::runtime_error(std::string("XsensFullBodyPlugin: SO_RCVTIMEO failed: ") + std::strerror(errno));
     }
 
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_ANY);
-    address.sin_port = htons(port);
-    if (::bind(socket_fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0)
+    sockaddr_in endpoint{};
+    endpoint.sin_family = AF_INET;
+    endpoint.sin_addr = bind_addr;
+    endpoint.sin_port = htons(port);
+    if (::bind(socket_fd_, reinterpret_cast<sockaddr*>(&endpoint), sizeof(endpoint)) < 0)
     {
-        const std::string reason = std::strerror(errno);
+        // Two failures dominate here and they have opposite fixes, so the hint follows errno
+        // rather than guessing. With a non-default --address, the second is the common one.
+        const int reason_errno = errno;
+        const std::string reason = std::strerror(reason_errno);
+        const char* hint = "";
+        if (reason_errno == EADDRINUSE)
+        {
+            hint = " (is another pusher already running?)";
+        }
+        else if (reason_errno == EADDRNOTAVAIL)
+        {
+            hint = " (no interface on this host has that address)";
+        }
         close_socket();
-        throw std::runtime_error("XsensFullBodyPlugin: bind to UDP port " + std::to_string(port) +
-                                 " failed: " + reason + " (is another pusher already running?)");
+        throw std::runtime_error("XsensFullBodyPlugin: bind to UDP " + address + ":" + std::to_string(port) +
+                                 " failed: " + reason + hint);
     }
+    bind_address_ = address;
     port_ = port;
 }
 
@@ -193,7 +214,8 @@ bool XsensFullBodyPlugin::wait_unless_stopped(int total_ms, const std::atomic<bo
 bool XsensFullBodyPlugin::recover_socket(const std::atomic<bool>& stop)
 {
     // Without a port, re-binding would take an ephemeral one the sender cannot reach -- which
-    // looks like a working pusher that never receives anything. Refuse instead.
+    // looks like a working pusher that never receives anything. Refuse instead. Zero here means
+    // the first bind never succeeded, since both members are assigned only on success.
     if (port_ == 0)
     {
         ++stats_.socket_recovery_failures;
@@ -210,11 +232,12 @@ bool XsensFullBodyPlugin::recover_socket(const std::atomic<bool>& stop)
         close_socket(); // the dead fd, before asking for a new one
         try
         {
-            open_socket(port_);
+            open_socket(bind_address_, port_);
             ++stats_.socket_recoveries;
-            log_rate_limited(LC_SOCKET_RECOVERED,
-                             "socket re-bound to UDP port " + std::to_string(port_) + ", receive loop continuing",
-                             std::cerr);
+            log_rate_limited(
+                LC_SOCKET_RECOVERED,
+                "socket re-bound to UDP " + bind_address_ + ":" + std::to_string(port_) + ", receive loop continuing",
+                std::cerr);
             return true;
         }
         catch (const std::exception& e)

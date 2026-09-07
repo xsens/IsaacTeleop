@@ -20,9 +20,16 @@ changing a pose and buys nothing.
 
 ```bash
 source ~/.cloudxr/run/cloudxr.env          # in this shell and every consumer's
-./xsens_full_body_plugin [collection_id] [udp_port] [max_flatbuffer_size]
-#  defaults:              xsens_full_body   9764       4096
+./xsens_full_body_plugin \
+    --collection-id=xsens_full_body \
+    --address=0.0.0.0 \
+    --port=9764 \
+    --max-flatbuffer-size=4096
 ```
+
+Every flag shown is its default, so bare `./xsens_full_body_plugin` is the same invocation; the
+defaults match MVN's "Isaac Teleop" preset. `--address` picks the interface to bind — the default
+accepts the stream on any of them, and `--address=127.0.0.1` confines the pusher to loopback.
 
 Then in MVN Studio: **Options → Network Streamer → preset "Isaac Teleop"**, tick the destination
 row, and move in the suit or press **Play** on a recording.
@@ -44,6 +51,11 @@ vendor  = deviceio.VendorConfig([(tracker, deviceio.TrackerVendor("body.xsens", 
 - **A `collection_id` mismatch fails silently and forever** — the two sides rendezvous on that
   string. A `max_flatbuffer_size` mismatch, by contrast, throws loudly and names the right value.
   So when a reader sees nothing, suspect the collection id first.
+- **`--address` has the same silent failure signature.** Bind to one interface and point MVN at a
+  *different* local address, and the datagrams are simply never delivered — no error on either
+  side, identical to a collection-id mismatch. A bad address is at least rejected at startup: only
+  a literal IPv4 is accepted, hostnames included, because an unresolvable name would otherwise
+  surface much later as an opaque `EADDRNOTAVAIL`.
 - **22 of 24 joints valid is correct.** MVN has no finger tracking, so `LEFT_HAND` (22) and
   `RIGHT_HAND` (23) carry a copy of the wrist pose flagged invalid, and `all_joint_poses_tracked`
   is structurally always false. Consult the per-joint flags.
@@ -102,7 +114,7 @@ so `XSENS_TELEOP_INJECT_RECV_ERRORS=<n>[:<errno>]` forces the next *n* receives 
 
 ```bash
 # three forced hard errors: expect socketRecoveries=3 and an unbroken stream
-XSENS_TELEOP_INJECT_RECV_ERRORS=3 ./xsens_full_body_plugin xsens_full_body 9764 4096
+XSENS_TELEOP_INJECT_RECV_ERRORS=3 ./xsens_full_body_plugin --address=127.0.0.1
 ```
 
 The session path needs no hook: `kill` the CloudXR runtime while streaming, and restart it inside
@@ -121,22 +133,27 @@ none of the I/O it decides it for. It is split out so it can be tested: the plug
 socket and an OpenXR session and cannot be constructed without a running CloudXR runtime, so this
 logic was previously reachable only through a live end-to-end run.
 
+`plugin_options.{hpp,cpp}` is split out for the same reason and holds everything the pusher
+decides about a *command line*: which form was used, what each flag means, and what is rejected
+before anything binds.
+
 ```bash
 # from the IsaacTeleop checkout, once configured with -DBUILD_TESTING=ON (see apply.sh)
-ctest --test-dir build-py312 -R xsens_frame_decision
+ctest --test-dir build-py312 -R 'xsens_' --output-on-failure
 
-# or, with no build tree at all -- the unit pulls in nothing but flatbuffers and the schema
+# or, with no build tree at all -- neither unit needs one
 g++ -std=c++20 -I. -I<generated-schema-dir> -I<flatbuffers-include> \
     tests/test_frame_decision.cpp frame_decision.cpp -lflatbuffers -o /tmp/t && /tmp/t
+g++ -std=c++20 -I. tests/test_plugin_options.cpp plugin_options.cpp -o /tmp/o && /tmp/o
 ```
 
-114 assertions, no runtime, no socket, no suit, milliseconds to run. The suite is
-mutation-checked: inverting the stale comparison, the rewind comparison, the whole-millisecond
-flag, the oversize check or the verifier, dropping the timeline clear on session reset, putting
-the duplicate-`seq`-0 defect back, or collapsing the skipped-sequence count back to a flag, each
-make it fail.
+114 and 120 assertions respectively, no runtime, no socket, no suit, milliseconds to run. The
+frame-decision suite is mutation-checked: inverting the stale comparison, the rewind comparison,
+the whole-millisecond flag, the oversize check or the verifier, dropping the timeline clear on
+session reset, putting the duplicate-`seq`-0 defect back, or collapsing the skipped-sequence
+count back to a flag, each make it fail.
 
-Three behaviours it pins that are easy to get wrong by accident:
+Three frame-decision behaviours it pins that are easy to get wrong by accident:
 
 - **The verifier runs before the sequence machine, so a payload it rejects never consumes its
   sequence number** and the next frame reads as a gap. That is deliberate: an unverified payload
