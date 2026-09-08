@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 Xsens Technologies B.V. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # xsens_full_body plugin
 
 Receives Xsens MVN Studio's **Isaac Teleop** UDP stream and republishes it as an Isaac Teleop
