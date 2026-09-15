@@ -231,7 +231,7 @@ See the status-line guide below — most of these are informational, not faults.
 
 ```
 delivered=250 seq=251 size=820 fnv1a64=0x2b... malformed=0 unverified=0 stale=0 truncated=0
-gapEvents=0 seqSkipped=0 resets=0 rewinds=0 nonWholeMs=0 socketRecoveries=0
+gapEvents=0 seqSkipped=0 resets=0 resyncs=0 rewinds=0 nonWholeMs=0 socketRecoveries=0
 socketRecoveryFailures=0 pushFailures=0 sessionRecoveries=0
 ```
 
@@ -241,7 +241,8 @@ socketRecoveryFailures=0 pushFailures=0 sessionRecoveries=0
 | `seq`, `size`, `fnv1a64` | Identity of the last frame — sequence number, byte size (820 for a live MVN pose), content hash. |
 | `malformed`, `unverified`, `stale`, `truncated` | Datagrams rejected: bad framing, failed structure check, out of order, or too large. Should stay at 0. |
 | `gapEvents` / `seqSkipped` | How many times the frame sequence broke, and how many frame numbers went missing in total. Both are reported because one long dropout and many single losses are very different faults with the same total. |
-| `resets` | MVN started a new session (sequence stepped back to 0). Normal when you restart a recording. |
+| `resets` | MVN started a new session. Normal when you restart a recording. |
+| `resyncs` | Of those sessions, the ones recognised only after half a second of stale frames, because the packet announcing the restart was lost. One or two are unremarkable; a number that keeps climbing means the link is dropping datagrams. |
 | `rewinds`, `nonWholeMs` | Timestamp oddities — scrubbing a recording, or a clock that isn't MVN's solver. **Purely informational: no frame is ever dropped because of a timestamp.** |
 | `socketRecoveries`, `sessionRecoveries` | Times the plugin recovered from a broken network socket or a restarted CloudXR runtime. |
 | `pushFailures`, `socketRecoveryFailures` | Failures encountered along the way to those recoveries. |
