@@ -176,7 +176,7 @@ flags rather than the all-joints flag.
 | Option | Default | What it does |
 |---|---|---|
 | `--collection-id=ID` | `xsens_full_body` | The name your application looks the stream up by. Both sides must use the same string. |
-| `--address=ADDR` | `0.0.0.0` | Which network interface accepts the suit stream. `0.0.0.0` is any; `127.0.0.1` confines it to this machine. Must be a literal IPv4 address — hostnames are rejected. |
+| `--address=ADDR` | `0.0.0.0` | Which network interface accepts the suit stream. `0.0.0.0` is any; `127.0.0.1` confines it to this machine. Must be a literal IPv4 address — hostnames are rejected. Launched through the plugin manager the default is `127.0.0.1` instead, because `plugin.yaml` passes it — a suit on another machine needs that line changed. |
 | `--port=N` | `9764` | UDP port to listen on. Must match MVN Studio's destination port. |
 | `--max-flatbuffer-size=N` | `4096` | Maximum frame size in bytes. Must match the value your application passes. |
 | `--help` | | Print the same summary. |
