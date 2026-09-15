@@ -41,9 +41,7 @@ void usage(const char* argv0)
               << "                            (default: " << defaults.max_flatbuffer_size << ")\n"
               << "  --help                    Show this message\n\n"
               << "The defaults match MVN's \"Isaac Teleop\" preset. `--address=127.0.0.1` confines the\n"
-              << "pusher to loopback; the default accepts the stream on every interface.\n\n"
-              << "Deprecated: the positional form `[collection_id] [udp_port] [max_flatbuffer_size]`\n"
-              << "is still accepted, but cannot be mixed with the flags above.\n";
+              << "pusher to loopback; the default accepts the stream on every interface.\n";
 }
 
 //! Every counter, on one line. Printed periodically and once more on exit -- including the
@@ -78,12 +76,6 @@ try
         return 1;
     case ParseOutcome::Ok:
         break;
-    }
-
-    if (options.used_legacy_positionals)
-    {
-        std::cerr << argv[0] << ": warning: the positional argument form is deprecated; use"
-                  << " --collection-id=, --port= and --max-flatbuffer-size= instead" << std::endl;
     }
 
     std::signal(SIGINT, handle_signal);

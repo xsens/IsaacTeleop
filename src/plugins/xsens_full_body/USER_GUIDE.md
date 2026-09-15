@@ -183,8 +183,8 @@ flags rather than the all-joints flag.
 
 Stop the plugin with **Ctrl-C**; it prints a final status line on the way out.
 
-An older positional form (`collection_id port max_flatbuffer_size`) still works but is deprecated,
-warns when used, and cannot be mixed with the flags above.
+Every option is a flag. A bare word on the command line is rejected rather than interpreted, so a
+mistyped flag cannot quietly become a value.
 
 ---
 
